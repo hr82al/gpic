@@ -89,10 +89,18 @@ mod tests {
     }
 
     #[test]
-    fn detect_falls_back_on_missing_root() {
-        assert_eq!(
-            detect_in(Path::new("/nonexistent-drm-root")).unwrap_or(FALLBACK),
-            FALLBACK
-        );
+    fn detect_in_falls_back_on_missing_root() {
+        assert_eq!(detect_in(Path::new("/nonexistent-drm-root")), None);
+    }
+
+    #[test]
+    fn detect_returns_positive_dimensions() {
+        // detect() читает жёстко заданный /sys/class/drm, поэтому на
+        // этой машине результат зависит от реального монитора (или от
+        // FALLBACK, если ничего не подключено/недоступно) — проверяем
+        // только то, что верно в любом случае: разумные ненулевые
+        // размеры.
+        let (w, h) = detect();
+        assert!(w > 0 && h > 0, "получили {w}x{h}");
     }
 }

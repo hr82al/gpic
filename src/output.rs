@@ -12,12 +12,21 @@ pub fn resolve_path(arg: Option<PathBuf>, now: &str) -> PathBuf {
     arg.unwrap_or_else(|| PathBuf::from(format!("gpic-{now}.jpg")))
 }
 
-/// Формат по расширению; всё незнакомое и безрасширенное — JPEG.
+/// Формат по расширению из ограниченного набора спецификации
+/// (`.png`, `.jpg`/`.jpeg`); всё незнакомое и безрасширенное — JPEG.
+/// Не используем `ImageFormat::from_extension` — он распознаёт куда
+/// больше форматов, чем есть кодировщиков, и это всплывает только
+/// после полной генерации картинки.
 fn format_for(path: &Path) -> ImageFormat {
-    path.extension()
+    match path
+        .extension()
         .and_then(|e| e.to_str())
-        .and_then(|e| ImageFormat::from_extension(e.to_ascii_lowercase()))
-        .unwrap_or(ImageFormat::Jpeg)
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => ImageFormat::Png,
+        _ => ImageFormat::Jpeg,
+    }
 }
 
 pub fn save(img: &DynamicImage, path: &Path) -> Result<()> {
@@ -67,6 +76,15 @@ mod tests {
     fn falls_back_to_jpeg_for_unknown_extension() {
         assert_eq!(format_for(Path::new("a.xyz")), ImageFormat::Jpeg);
         assert_eq!(format_for(Path::new("noext")), ImageFormat::Jpeg);
+    }
+
+    #[test]
+    fn falls_back_to_jpeg_for_extensions_outside_the_whitelist() {
+        // `ImageFormat::from_extension` узнало бы оба этих расширения,
+        // но спецификация ограничивает набор до png/jpg/jpeg — всё
+        // остальное должно тихо стать JPEG, а не падать после генерации.
+        assert_eq!(format_for(Path::new("a.dds")), ImageFormat::Jpeg);
+        assert_eq!(format_for(Path::new("a.webp")), ImageFormat::Jpeg);
     }
 
     #[test]

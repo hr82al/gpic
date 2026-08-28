@@ -34,7 +34,10 @@ fn run() -> Result<()> {
     println!("Размер: {width}x{height}, seed: {seed}");
     println!("Генерация занимает около 40 секунд…");
 
-    let img = provider::fetch(&text, width, height, seed)?;
+    let (img, used_seed) = provider::fetch(&text, width, height, seed)?;
+    if used_seed != seed {
+        println!("Повтор удался с seed: {used_seed}");
+    }
     println!("Получено {}x{}, масштабирую…", img.width(), img.height());
 
     let scaled = resize::to(img, width, height);
