@@ -78,4 +78,16 @@ mod tests {
         use clap::CommandFactory;
         Args::command().debug_assert();
     }
+
+    #[test]
+    fn accepts_seed_at_the_service_limit() {
+        let args = Args::try_parse_from(["gpic", "-s", "2147483647"]).unwrap();
+        assert_eq!(args.seed, Some(2_147_483_647));
+    }
+
+    #[test]
+    fn rejects_seed_above_the_service_limit() {
+        assert!(Args::try_parse_from(["gpic", "-s", "2147483648"]).is_err());
+        assert!(Args::try_parse_from(["gpic", "-s", "4000000000"]).is_err());
+    }
 }
