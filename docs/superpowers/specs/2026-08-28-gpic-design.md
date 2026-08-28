@@ -150,7 +150,11 @@ gpic [ОПЦИИ] [ФАЙЛ]
 
 ## Зависимости
 
-`clap` (derive), `reqwest` (blocking, rustls-tls), `image`, `rand`, `anyhow`.
+`clap` (derive), `reqwest` 0.13 (`blocking`, `rustls`, `system-proxy`), `image`, `rand`,
+`chrono` (метка времени в имени файла), `anyhow`. Dev-зависимость: `tempfile`.
+
+В reqwest 0.13 фича TLS называется `rustls`, а не `rustls-tls`, и чтение
+`HTTP_PROXY`/`HTTPS_PROXY` требует отдельной фичи `system-proxy` — проверено.
 
 ## Вне области
 
