@@ -1,4 +1,5 @@
 mod cli;
+mod prompt;
 mod screen;
 
 fn main() {
