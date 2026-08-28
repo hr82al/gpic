@@ -14,9 +14,16 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="$ROOT/build"
 MODELS="$ROOT/models"
 SRC="$BUILD/stable-diffusion.cpp"
+LLAMA_SRC="$BUILD/llama.cpp"
 LAUNCHER="$HOME/.local/bin/gpic"
 
-PACKAGES=(libvulkan-dev glslc vulkan-tools cmake build-essential git curl)
+# spirv-headers, glslang-dev и libshaderc-dev нужны именно для Vulkan-бэкенда:
+# без них cmake падает на поиске SPIRV-Headers. Проверено на Debian 13.
+PACKAGES=(
+    libvulkan-dev glslc vulkan-tools
+    spirv-headers spirv-tools glslang-dev libshaderc-dev
+    cmake build-essential git curl
+)
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m    %s\033[0m\n' "$*"; }
@@ -46,10 +53,17 @@ build_engine() {
     fi
 
     mkdir -p "$BUILD"
-    if [ ! -d "$SRC" ]; then
+    if [ ! -d "$SRC/.git" ]; then
         say "Клонирую stable-diffusion.cpp"
-        git clone --recursive --depth 1 \
-            https://github.com/leejet/stable-diffusion.cpp "$SRC"
+        git clone https://github.com/leejet/stable-diffusion.cpp "$SRC"
+    fi
+
+    # Подмодули клонируются на полную глубину намеренно. С --depth 1 git
+    # тянет только вершину ветки, а закреплённый коммит ggml в такую
+    # историю не попадает — получается «Unable to find current revision».
+    if [ ! -f "$SRC/ggml/CMakeLists.txt" ]; then
+        say "Подтягиваю подмодули (ggml, libwebp, libwebm)"
+        git -C "$SRC" submodule update --init --recursive
     fi
 
     # Vulkan — основной путь: на встроенной Radeon он работает без ROCm,
@@ -66,11 +80,55 @@ build_engine() {
         cmake --build "$SRC/build" --config Release -j"$(nproc)"
     fi
 
+    # В свежих версиях бинарник называется sd-cli; в старых — sd.
     local built
-    built="$(find "$SRC/build" -name sd -type f -perm -u+x | head -1)"
-    [ -n "$built" ] || { echo "Сборка прошла, но бинарник sd не найден" >&2; exit 1; }
+    built="$(find "$SRC/build" \( -name sd-cli -o -name sd \) -type f -perm -u+x | head -1)"
+    [ -n "$built" ] || { echo "Сборка прошла, но бинарник sd-cli не найден" >&2; exit 1; }
     cp "$built" "$BUILD/sd"
     say "Движок готов: $BUILD/sd"
+}
+
+# ------------------------------------------------------- модель-промптер
+
+# Описания картинок придумывает маленькая языковая модель через llama.cpp.
+# Без неё gpic работает по запасному списку из десятка описаний — то есть
+# остаётся рабочим, но однообразным.
+build_prompter() {
+    if [ -x "$BUILD/llama-cli" ]; then
+        say "Промптер уже собран: $BUILD/llama-cli"
+        return
+    fi
+
+    mkdir -p "$BUILD"
+    if [ ! -d "$LLAMA_SRC/.git" ]; then
+        say "Клонирую llama.cpp"
+        git clone https://github.com/ggml-org/llama.cpp "$LLAMA_SRC"
+    fi
+
+    say "Собираю llama.cpp с Vulkan"
+    # LLAMA_CURL=OFF: скачивание моделей нам не нужно, а зависимость от
+    # libcurl лишняя.
+    if cmake -S "$LLAMA_SRC" -B "$LLAMA_SRC/build" -DCMAKE_BUILD_TYPE=Release \
+             -DGGML_VULKAN=ON -DLLAMA_CURL=OFF \
+         && cmake --build "$LLAMA_SRC/build" --config Release \
+                  -j"$(nproc)" --target llama-cli; then
+        :
+    else
+        warn "Сборка промптера с Vulkan не удалась — пробую режим CPU."
+        rm -rf "$LLAMA_SRC/build"
+        cmake -S "$LLAMA_SRC" -B "$LLAMA_SRC/build" -DCMAKE_BUILD_TYPE=Release \
+              -DLLAMA_CURL=OFF
+        cmake --build "$LLAMA_SRC/build" --config Release -j"$(nproc)" --target llama-cli
+    fi
+
+    local built
+    built="$(find "$LLAMA_SRC/build" -name llama-cli -type f -perm -u+x | head -1)"
+    if [ -z "$built" ]; then
+        warn "llama-cli не собрался. gpic будет работать по запасному списку описаний."
+        return
+    fi
+    cp "$built" "$BUILD/llama-cli"
+    say "Промптер готов: $BUILD/llama-cli"
 }
 
 # ------------------------------------------------------------------- веса
@@ -94,12 +152,18 @@ fetch() {
 
 fetch_models() {
     mkdir -p "$MODELS"
-    # Q5_K_S — компромисс: заметно лучше Q4 по качеству и при этом вместе
-    # с энкодером укладывается в доступную GPU-память (4 ГБ VRAM + 13.9 ГБ GTT).
+    # Q5_K_S: пик памяти при генерации 1920x1200 — 11 ГБ из 27, так что
+    # запасной облегчённый вес не нужен. Ключевое здесь не квантование, а
+    # флаги в gpic.py (тайловый VAE и выгрузка энкодеров): без них тот же
+    # вес требовал 27 ГБ и ронял драйвер.
     fetch "flux1-schnell-Q5_K_S.gguf" "city96/FLUX.1-schnell-gguf" "flux1-schnell-Q5_K_S.gguf"
     fetch "t5xxl-Q5_0.gguf"           "second-state/FLUX.1-schnell-GGUF" "t5xxl-Q5_0.gguf"
     fetch "clip_l.safetensors"        "second-state/FLUX.1-schnell-GGUF" "clip_l.safetensors"
     fetch "ae.safetensors"            "second-state/FLUX.1-schnell-GGUF" "ae.safetensors"
+    # Модель, придумывающая описания. Полтора миллиарда параметров: на
+    # 0.5B заметно беднее фантазия, а генерация тридцати токенов на фоне
+    # шестиминутной отрисовки картинки ничего не стоит.
+    fetch "prompter.gguf" "Qwen/Qwen2.5-1.5B-Instruct-GGUF" "qwen2.5-1.5b-instruct-q4_k_m.gguf"
     say "Веса на месте, суммарно $(du -sh "$MODELS" | cut -f1)"
 }
 
@@ -128,17 +192,23 @@ smoke_test() {
     rm -f "$out"
     local started elapsed
     started="$(date +%s)"
-    python3 "$ROOT/gpic.py" -r 1024x640 -s 42 \
+    python3 "$ROOT/gpic.py" -r 512x320 -s 42 \
         -p "misty mountain lake at golden hour, landscape photography" "$out"
     elapsed=$(( $(date +%s) - started ))
-    say "Контрольная картинка 1024x640 сгенерирована за ${elapsed} с"
-    warn "Экранное разрешение содержит примерно вдвое больше пикселей,"
-    warn "так что реальная генерация займёт ориентировочно $(( elapsed * 2 )) с."
+
+    say "Контрольная картинка 512x320 готова за ${elapsed} с"
+    # Время растёт быстрее числа пикселей: встроенная видеокарта упирается
+    # в пропускную способность памяти. На эталонной машине 512x320 занимает
+    # 29 с, а 1920x1200 — 387 с, то есть в 13 раз дольше при 14-кратном
+    # росте площади. Этим отношением и пересчитываем.
+    warn "Картинка в разрешении экрана займёт примерно $(( elapsed * 13 / 60 )) мин."
+    warn "Проверить: gpic"
 }
 
 main() {
     install_packages
     build_engine
+    build_prompter
     fetch_models
     install_launcher
     smoke_test

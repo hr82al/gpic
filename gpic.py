@@ -11,7 +11,6 @@ stable-diffusion.cpp с бэкендом Vulkan. Ни сети, ни ключе�
 """
 
 import argparse
-import os
 import random
 import subprocess
 import sys
@@ -29,6 +28,11 @@ TEXT_ENCODER = MODELS / "t5xxl-Q5_0.gguf"
 CLIP_L = MODELS / "clip_l.safetensors"
 VAE = MODELS / "ae.safetensors"
 
+# Маленькая языковая модель, придумывающая описания «с нуля». Нужна не
+# всегда: без неё работает комбинаторика по спискам, просто беднее.
+LLAMA_BINARY = ROOT / "build" / "llama-cli"
+PROMPTER_MODEL = MODELS / "prompter.gguf"
+
 # FLUX.1-schnell дистиллирована под малое число шагов и не использует
 # classifier-free guidance: cfg-scale обязан быть 1.0, шагов хватает четырёх.
 STEPS = 4
@@ -37,47 +41,203 @@ SAMPLING = "euler"
 
 FALLBACK_RESOLUTION = (1920, 1200)
 
-SUBJECTS = [
-    "misty mountain lake",
-    "snow-covered pine forest",
-    "rocky coastline with breaking waves",
-    "rolling hills under a wide sky",
-    "quiet northern fjord",
-    "desert dunes with long shadows",
-    "alpine meadow in bloom",
-    "old stone bridge over a river",
-    "autumn birch grove",
-    "glacier tongue meeting dark water",
-    "lavender field stretching to the horizon",
-    "storm clouds over open plains",
+# Описания придумывает маленькая языковая модель, а не списки слов.
+# Перечислять сюжеты руками бессмысленно: сколько ни пиши, получится
+# конечный список, который приедается. Модель же внутри темы выдумывает
+# бесконечно, и наша задача — только задать направление.
+#
+# Инструкции модели на английском: FLUX обучался на английских подписях
+# и понимает их точнее.
+
+# Широкие области, из которых берётся тема. Намеренно общие: конкретику
+# придумывает модель. Добавлять сюда новые темы — самый дешёвый способ
+# расширить репертуар.
+THEMES = [
+    "wild landscapes", "coastlines and open water", "mountains and high places",
+    "forests and undergrowth", "deserts and arid land", "polar and frozen places",
+    "city architecture", "interiors and quiet rooms", "industrial spaces",
+    "bridges, towers and infrastructure", "ruins and abandoned places",
+    "space and astronomy", "atmospheric phenomena", "underwater and deep sea",
+    "microscopic structures", "minerals, crystals and geology",
+    "plants and botanical detail", "animals in their habitat",
+    "birds and flight", "insects and small creatures",
+    "machines and mechanisms", "vehicles and transport",
+    "everyday objects arranged", "textiles, fibres and surfaces",
+    "abstract geometry", "flowing organic forms", "light and shadow studies",
+    "weather and storms", "gardens and cultivated land",
+    "harbours and working shores", "deep forests at night",
+    "volcanic and geothermal terrain", "canyons and rock formations",
+    "reflections and mirrored scenes", "silhouettes against bright skies",
+    "aerial views of terrain", "still life with natural objects",
+    "science-fiction environments", "mythic and dreamlike places",
+    "seasonal transitions",
 ]
 
-LIGHT = [
-    "golden hour",
-    "blue hour",
-    "soft morning fog",
-    "dramatic sunset",
-    "overcast diffused light",
-    "clear starry night",
-    "low winter sun",
-    "after the rain",
+# Углы захода для творческого режима. Без них маленькая модель
+# сваливается в один и тот же «закат над горами» — она сильно
+# тяготеет к банальному, и сбить её можно только заданием направления.
+CREATIVE_ANGLES = [
+    "an unexpected place nobody photographs",
+    "two unrelated things merged into one scene",
+    "an everyday object seen in an extraordinary way",
+    "a moment from an imaginary world",
+    "something microscopic treated as a vast landscape",
+    "an abandoned structure reclaimed by something unusual",
+    "a scene defined entirely by one strange material",
+    "a view from an impossible vantage point",
+    "an atmospheric phenomenon that does not exist",
+    "machinery imagined as a living organism",
+    "a landscape built out of an unrelated substance",
+    "a familiar place under impossible light",
+    "architecture growing like a plant",
+    "a still life of objects that should not coexist",
+    "the inside of something normally seen from outside",
 ]
 
-STYLES = [
-    "landscape photography, sharp detail",
-    "cinematic wide shot",
-    "painterly, rich colors",
-    "minimalist composition",
-    "high dynamic range photograph",
-    "serene and atmospheric",
+STYLE_HINTS = [
+    "photographic realism", "cinematic composition", "painterly and textured",
+    "minimalist and graphic", "richly detailed illustration",
+    "moody and atmospheric", "clean modern render", "soft impressionistic",
+]
+
+THEMED_INSTRUCTION = (
+    "Write one vivid caption describing a single photograph or painting. "
+    "Subject area: {theme}. Visual treatment: {style}. "
+    "One line, under 30 words. Concrete visual nouns and adjectives only. "
+    "Describe what is seen, not what it means. "
+    "No quotes, no explanation, no title, no text visible in the image."
+)
+
+CREATIVE_INSTRUCTION = (
+    "Invent one striking, unusual caption describing a single image: {angle}. "
+    "Be surprising and specific, avoid the obvious. Visual treatment: {style}. "
+    "One line, under 30 words. Concrete visual nouns and adjectives only. "
+    "No quotes, no explanation, no title, no text visible in the image."
+)
+
+# Хвост, подталкивающий модель рисования к детальному результату.
+QUALITY_TAIL = "beautiful desktop wallpaper, intricate detail, fine texture, natural depth"
+
+# Доля описаний, придуманных в творческом режиме на максимальной температуре.
+CREATIVE_CHANCE = 0.30
+
+# Температуры подобраны замером, а не на глаз. Творческий режим держится
+# на min-p, а не на одной температуре: min-p отсекает токены ниже доли от
+# самого вероятного, поэтому связность сохраняется там, где голая
+# температура уже даёт бессвязицу.
+THEMED_TEMPERATURE = "0.90"
+CREATIVE_TEMPERATURE = "1.10"
+MIN_P = "0.05"
+
+LLM_MAX_TOKENS = "70"
+LLM_TIMEOUT_SECONDS = 120
+
+# Запасные описания на случай, если llama.cpp не собран или модель не
+# скачана. Утилита обязана работать и без них, пусть и однообразно.
+FALLBACK_PROMPTS = [
+    "misty mountain lake at first light, still water, layered ridges fading into haze",
+    "snow-covered pine forest under low winter sun, long blue shadows across the drifts",
+    "rocky coastline with breaking waves, spray caught in golden backlight",
+    "desert dunes with long shadows at dusk, wind-carved ridges, deep amber tones",
+    "storm clouds massing over open plains, shafts of light breaking through",
+    "frost crystals spreading across dark glass, sharp macro detail",
+    "spiral galaxy against deep space, dust lanes and scattered star clusters",
+    "rain-slick city street at night, neon reflections stretched across wet asphalt",
+    "flowing liquid metal forms, polished highlights on smooth curves",
+    "ancient stone bridge over a green river, moss on weathered blocks",
+    "bioluminescent jellyfish drifting in black water, translucent bells glowing",
+    "terraced fields on a steep hillside at dawn, mist pooling in the valleys",
 ]
 
 
-def random_prompt(rng):
-    """Собирает промпт из трёх независимых списков — сотни комбинаций."""
-    return "{}, {}, {}, beautiful wallpaper".format(
-        rng.choice(SUBJECTS), rng.choice(LIGHT), rng.choice(STYLES)
-    )
+def llm_prompt(rng):
+    """Просит языковую модель придумать описание. None, если не вышло.
+
+    Отсутствие модели не ошибка: gpic должен работать и без llama.cpp,
+    просто с более бедным разнообразием.
+    """
+    if not LLAMA_BINARY.exists() or not PROMPTER_MODEL.exists():
+        return None
+
+    style = rng.choice(STYLE_HINTS)
+    if rng.random() < CREATIVE_CHANCE:
+        instruction = CREATIVE_INSTRUCTION.format(
+            angle=rng.choice(CREATIVE_ANGLES), style=style)
+        temperature = CREATIVE_TEMPERATURE
+    else:
+        instruction = THEMED_INSTRUCTION.format(
+            theme=rng.choice(THEMES), style=style)
+        temperature = THEMED_TEMPERATURE
+
+    command = [
+        str(LLAMA_BINARY), "-m", str(PROMPTER_MODEL),
+        "-p", instruction,
+        "-n", LLM_MAX_TOKENS,
+        "--temp", temperature,
+        "--min-p", MIN_P,
+        "--repeat-penalty", "1.1",
+        "-s", str(rng.randrange(0, 2**31)),
+        "--no-display-prompt",
+        "-st",
+        "-ngl", "99",
+    ]
+    try:
+        result = subprocess.run(
+            command, capture_output=True, text=True,
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+
+    return clean_llm_output(result.stdout)
+
+
+def clean_llm_output(text):
+    """Вытаскивает описание из вывода llama-cli.
+
+    В этой сборке llama-cli работает только в режиме диалога и печатает
+    баннер, эхо промпта со знаком «>» и строку статистики в квадратных
+    скобках. Ответ лежит между эхом и статистикой — по этим двум маркерам
+    и ориентируемся; если структура не совпала, пробуем эвристику по длине.
+    """
+    lines = [line.strip() for line in text.replace("\r", "\n").splitlines()]
+
+    answer = []
+    seen_echo = False
+    for line in lines:
+        if not seen_echo:
+            if line.startswith(">"):
+                seen_echo = True
+            continue
+        if line.startswith("[") or line.startswith("Exiting"):
+            break
+        if line:
+            answer.append(line)
+
+    candidates = [" ".join(answer)] if answer else []
+    candidates.extend(lines)
+
+    for candidate in candidates:
+        candidate = candidate.strip().strip('"').strip("'")
+        candidate = candidate.lstrip("-*0123456789. ").strip().rstrip('"').strip()
+        if not (20 <= len(candidate) <= 300):
+            continue
+        if candidate.startswith((">", "[", "/")) or candidate.endswith(":"):
+            continue
+        if candidate.lower().startswith(("here", "sure", "caption", "write ", "invent ")):
+            continue
+        return candidate
+    return None
+
+
+def compose_prompt(rng):
+    """Описание от языковой модели, а при её отсутствии — из запасного списка."""
+    generated = llm_prompt(rng)
+    if generated:
+        return f"{generated}, {QUALITY_TAIL}"
+    return f"{rng.choice(FALLBACK_PROMPTS)}, {QUALITY_TAIL}"
 
 
 def parse_resolution(text):
@@ -131,9 +291,9 @@ def align16(value):
 def check_installed():
     """Понятная ошибка вместо загадочного падения, если setup.sh не запускали."""
     missing = [
-        str(path)
-        for path in (SD_BINARY, DIFFUSION_MODEL, TEXT_ENCODER, CLIP_L, VAE)
-        if not path.exists()
+        str(p)
+        for p in (SD_BINARY, DIFFUSION_MODEL, TEXT_ENCODER, CLIP_L, VAE)
+        if not p.exists()
     ]
     if missing:
         print("Не хватает файлов движка или весов:", file=sys.stderr)
@@ -147,6 +307,20 @@ def build_command(prompt, width, height, seed, out_path):
     return [
         str(SD_BINARY),
         "--diffusion-model", str(DIFFUSION_MODEL),
+        # Flash attention здесь не оптимизация, а необходимость: без него
+        # тензоры внимания не влезают в лимит буфера Vulkan, движок
+        # сваливается на медленный путь и шаг занимает 337 с вместо 88.
+        "--diffusion-fa",
+        # Тайловое декодирование: латент режется на куски, каждый проходит
+        # через полноразмерный VAE отдельно. Без этого декодирование картинки
+        # размером с экран требует буфера больше 4 ГБ VRAM, драйвер теряет
+        # устройство («device lost on Vulkan0») и результат гибнет уже после
+        # того, как все шаги отработали. Качество при этом полное — в отличие
+        # от TAESD, который дешевле, но декодирует приближённо.
+        "--vae-tiling",
+        # Текстовые энкодеры нужны только на первой стадии, для кодирования
+        # промпта. Без этого флага их 3.4 ГБ висят в видеопамяти до конца.
+        "--params-backend", "te=disk",
         "--t5xxl", str(TEXT_ENCODER),
         "--clip_l", str(CLIP_L),
         "--vae", str(VAE),
@@ -183,7 +357,7 @@ def main():
     rng = random.Random()
     width, height = args.resolution or detect_screen()
     aligned = (align16(width), align16(height))
-    prompt = args.prompt or random_prompt(rng)
+    prompt = args.prompt or compose_prompt(rng)
     seed = args.seed if args.seed is not None else rng.randrange(0, 2**31)
 
     out_path = Path(
@@ -201,7 +375,10 @@ def main():
     started = time.monotonic()
     command = build_command(prompt, aligned[0], aligned[1], seed, out_path)
     # Вывод движка идёт в stderr и показывает прогресс по шагам — не прячем его.
-    result = subprocess.run(command, env={**os.environ, "GGML_VK_VISIBLE_DEVICES": "0"})
+    # Устройство Vulkan не навязываем: ggml сам отбрасывает программный
+    # llvmpipe и выбирает настоящую видеокарту. Зашитый номер устройства
+    # сломался бы на машине с другим порядком перечисления.
+    result = subprocess.run(command)
     elapsed = time.monotonic() - started
 
     if result.returncode != 0:
