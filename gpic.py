@@ -32,35 +32,27 @@ MODELS = ROOT / "models"
 # а по показателям детализации Q5 был даже чуть выше. Но время у них
 # одинаковое (упор в вычисления, а не в перекачку весов), так что Q8 стоит
 # только памяти — пик 17.4 ГБ против 11.1. При 27 ГБ это приемлемо.
-DIFFUSION_WEIGHTS = [
-    ("flux1-schnell-Q8_0.gguf", 12_690_000_000),
-    ("flux1-schnell-Q5_K_S.gguf", 8_260_000_000),
-]
-
-TEXT_ENCODERS = [
-    ("t5xxl-Q8_0.gguf", 5_200_000_000),
-    ("t5xxl-Q5_0.gguf", 3_360_000_000),
-]
+DIFFUSION_WEIGHTS = [("flux1-schnell-Q8_0.gguf", 12_690_000_000)]
+TEXT_ENCODERS = [("t5xxl-Q8_0.gguf", 5_200_000_000)]
 CLIP_L = MODELS / "clip_l.safetensors"
 VAE = MODELS / "ae.safetensors"
 
-# Быстрый режим: SDXL-Turbo вместо FLUX. Вчетверо меньше параметров и
-# дистиллирован под один-два шага.
+# Быстрый режим: тот же FLUX, но в четверти размера, с последующим
+# нейросетевым увеличением ESRGAN. 34 секунды против шести с половиной
+# минут — измерено.
 #
-# Рисуем в четверть целевого размера и увеличиваем нейросетевым ESRGAN.
-# Прямая генерация в разрешении экрана НЕ работает: модель обучена на
-# 512x512, и на площади в девять раз большей она достраивает композицию
-# повторением — сросшиеся фигуры, лишние руки, два горизонта. На пейзаже
-# это незаметно (лишняя гряда сходит за гряду), на людях видно сразу.
+# Почему не второй проход диффузии: он идёт в полном разрешении и стоит
+# как отдельная генерация, поэтому «половина плюс дорисовка» выигрыша
+# почти не даёт.
 #
-# Негативным промптом это не лечится: у Turbo cfg-scale равен 1.0, а при
-# единице classifier-free guidance выключен и негативный промпт не
-# действует. Поднять cfg нельзя — модель под него не дистиллирована.
-FAST_MODEL = MODELS / "sdxl-turbo-fp16.safetensors"
+# Почему не SDXL-Turbo: он вдвадцатеро быстрее, но лепит руки и лица —
+# слабое место архитектуры SDXL, которое не лечится ни разрешением, ни
+# промптом (при cfg-scale 1.0 негативный промпт не действует вовсе).
+#
+# Чем платим: фигуры в кадре мелкие, лицо крупным планом не проработать —
+# на это просто не хватает пикселей. Для пейзажей и абстракции незаметно.
+FAST_DIVISOR = 4
 UPSCALER = MODELS / "RealESRGAN_x4.pth"
-FAST_STEPS = 2
-FAST_CFG_SCALE = "1.0"
-FAST_UPSCALE = 4
 
 # Маленькая языковая модель, придумывающая описания «с нуля». Нужна не
 # всегда: без неё работает запасной список описаний, просто беднее.
@@ -467,21 +459,17 @@ def pick_complete(candidates):
 
 def check_installed(fast):
     """Понятная ошибка вместо загадочного падения, если setup.sh не запускали."""
-    needed = [SD_BINARY]
-    model = encoder = None
+    needed = [SD_BINARY, CLIP_L, VAE]
     if fast:
-        needed += [FAST_MODEL, UPSCALER]
-    else:
-        needed += [CLIP_L, VAE]
-        model = pick_complete(DIFFUSION_WEIGHTS)
-        encoder = pick_complete(TEXT_ENCODERS)
+        needed.append(UPSCALER)
+    model = pick_complete(DIFFUSION_WEIGHTS)
+    encoder = pick_complete(TEXT_ENCODERS)
 
     missing = [str(p) for p in needed if not p.exists()]
-    if not fast:
-        if model is None:
-            missing.append(f"{MODELS}/{DIFFUSION_WEIGHTS[-1][0]} (или Q8_0)")
-        if encoder is None:
-            missing.append(f"{MODELS}/{TEXT_ENCODERS[-1][0]} (или Q8_0)")
+    if model is None:
+        missing.append(f"{MODELS}/{DIFFUSION_WEIGHTS[0][0]}")
+    if encoder is None:
+        missing.append(f"{MODELS}/{TEXT_ENCODERS[0][0]}")
 
     if missing:
         print("Не хватает файлов движка или весов "
@@ -494,29 +482,17 @@ def check_installed(fast):
     return model, encoder
 
 
-def build_fast_command(prompt, width, height, seed, out_path):
-    """SDXL-Turbo в четверти размера плюс нейросетевое увеличение вчетверо."""
+def build_command(model, encoder, prompt, width, height, seed, out_path,
+                  fast=False):
+    """Команда движка. В быстром режиме рисуем в четверть и увеличиваем."""
+    extra = []
+    if fast:
+        extra = ["--upscale-model", str(UPSCALER)]
+        width = align_up(width // FAST_DIVISOR, 16)
+        height = align_up(height // FAST_DIVISOR, 16)
     return [
         str(SD_BINARY),
-        "-m", str(FAST_MODEL),
-        "--upscale-model", str(UPSCALER),
-        "--diffusion-fa",
-        "--vae-tiling",
-        "--params-backend", "te=disk",
-        "-p", prompt,
-        "-W", str(width),
-        "-H", str(height),
-        "--steps", str(FAST_STEPS),
-        "--cfg-scale", FAST_CFG_SCALE,
-        "--sampling-method", SAMPLING,
-        "--seed", str(seed),
-        "-o", str(out_path),
-    ]
-
-
-def build_command(model, encoder, prompt, width, height, seed, out_path):
-    return [
-        str(SD_BINARY),
+        *extra,
         "--diffusion-model", str(model),
         # Flash attention здесь не оптимизация, а необходимость: без него
         # тензоры внимания не влезают в лимит буфера Vulkan, движок
@@ -564,7 +540,7 @@ def main():
     )
     parser.add_argument(
         "-f", "--fast", action="store_true",
-        help="быстрый режим: SDXL-Turbo вместо FLUX, десятки секунд вместо минут",
+        help="быстрый режим: четверть размера плюс ESRGAN, около 35 секунд",
     )
     parser.add_argument(
         "file", nargs="?",
@@ -579,11 +555,7 @@ def main():
     # Движок выравнивает размеры: SDXL до кратного 64, FLUX до 16. Округляем
     # ВВЕРХ, чтобы потом подрезать до запрошенного, а не растягивать.
     # В быстром режиме рисуем в четверть — увеличение вернёт размер.
-    if args.fast:
-        aligned = (align_up(width // FAST_UPSCALE, 64),
-                   align_up(height // FAST_UPSCALE, 64))
-    else:
-        aligned = (align_up(width, 16), align_up(height, 16))
+    aligned = (align_up(width, 16), align_up(height, 16))
     prompt = args.prompt or compose_prompt(rng, args.random)
     seed = args.seed if args.seed is not None else rng.randrange(0, 2**31)
 
@@ -593,16 +565,16 @@ def main():
 
     print(f"Промпт: {prompt}")
     print(f"Размер: {width}x{height}, seed: {seed}")
+    print(f"Модель: {model.name}, энкодер: {encoder.name}")
     if args.fast:
-        print(f"Быстрый режим: SDXL-Turbo рисует {aligned[0]}x{aligned[1]}, "
-              f"ESRGAN увеличивает до {aligned[0] * FAST_UPSCALE}x"
-              f"{aligned[1] * FAST_UPSCALE}")
-        command = build_fast_command(prompt, aligned[0], aligned[1], seed, out_path)
+        base = (align_up(aligned[0] // FAST_DIVISOR, 16),
+                align_up(aligned[1] // FAST_DIVISOR, 16))
+        print(f"Быстрый режим: рисуем {base[0]}x{base[1]}, "
+              f"ESRGAN увеличивает вчетверо — около 35 секунд")
     else:
-        print(f"Модель: {model.name}, энкодер: {encoder.name}")
         print("Генерация идёт локально и занимает несколько минут…")
-        command = build_command(model, encoder, prompt,
-                                aligned[0], aligned[1], seed, out_path)
+    command = build_command(model, encoder, prompt,
+                            aligned[0], aligned[1], seed, out_path, args.fast)
 
     started = time.monotonic()
     # Вывод движка идёт в stderr и показывает прогресс по шагам — не прячем его.
