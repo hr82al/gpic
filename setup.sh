@@ -139,15 +139,27 @@ build_prompter() {
 fetch() {
     local name="$1" repo="$2" path="$3"
     local dest="$MODELS/$name"
-    if [ -s "$dest" ]; then
-        say "Уже скачано: $name ($(du -h "$dest" | cut -f1))"
-        return
-    fi
-    say "Качаю $name из $repo"
-    # --continue-at позволяет продолжить прерванную загрузку.
+    local before=0
+    [ -f "$dest" ] && before=$(stat -c %s "$dest")
+
+    # Проверять «файл существует и непустой» нельзя: оборванная загрузка
+    # тогда считается завершённой, и обещание «запусти снова — продолжит»
+    # оказывается ложью. Отдаём решение curl: с --continue-at он докачает
+    # хвост, а на полном файле завершится мгновенно сам.
+    say "Проверяю $name"
     curl -L --fail --continue-at - --progress-bar \
-        -o "$dest" "https://huggingface.co/$repo/resolve/main/$path"
-    say "Готово: $name ($(du -h "$dest" | cut -f1))"
+        -o "$dest" "https://huggingface.co/$repo/resolve/main/$path" || {
+        # 416 значит «докачивать нечего» — файл уже целый.
+        [ "$?" = "33" ] || [ -s "$dest" ] || return 1
+    }
+
+    local after
+    after=$(stat -c %s "$dest")
+    if [ "$after" -eq "$before" ]; then
+        say "Уже на месте: $name ($(du -h "$dest" | cut -f1))"
+    else
+        say "Готово: $name ($(du -h "$dest" | cut -f1))"
+    fi
 }
 
 fetch_models() {
