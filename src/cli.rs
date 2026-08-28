@@ -2,7 +2,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "gpic", about = "Генератор случайных картинок для рабочего стола")]
+#[command(
+    name = "gpic",
+    about = "Генератор случайных картинок для рабочего стола"
+)]
 pub struct Args {
     /// Промпт; без него будет случайный
     #[arg(short, long)]
@@ -12,8 +15,9 @@ pub struct Args {
     #[arg(short, long, value_parser = parse_resolution)]
     pub resolution: Option<(u32, u32)>,
 
-    /// Seed для воспроизведения конкретной картинки
-    #[arg(short, long)]
+    /// Seed для воспроизведения конкретной картинки (сервис принимает
+    /// значения не больше 2147483647)
+    #[arg(short, long, value_parser = clap::value_parser!(u32).range(0..=2_147_483_647))]
     pub seed: Option<u32>,
 
     /// Путь или просто имя файла; без него — gpic-ГГГГММДД-ЧЧММСС.jpg

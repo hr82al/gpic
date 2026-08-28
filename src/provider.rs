@@ -28,7 +28,10 @@ fn get_bytes(client: &reqwest::blocking::Client, url: Url) -> Result<Vec<u8>> {
         let head: String = body.chars().take(200).collect();
         bail!("сервис ответил {status}: {head}");
     }
-    Ok(response.bytes().context("не удалось прочитать ответ")?.to_vec())
+    Ok(response
+        .bytes()
+        .context("не удалось прочитать ответ")?
+        .to_vec())
 }
 
 /// Запрашивает картинку. Пропорция соблюдается сервисом, абсолютный
@@ -76,7 +79,10 @@ mod tests {
     #[test]
     fn percent_encodes_non_ascii_prompt() {
         let url = build_url("ночной город", 800, 600, 1).unwrap();
-        assert!(url.as_str().starts_with("https://image.pollinations.ai/prompt/%D0%BD"));
+        assert!(
+            url.as_str()
+                .starts_with("https://image.pollinations.ai/prompt/%D0%BD")
+        );
         assert!(!url.as_str().contains(' '));
     }
 

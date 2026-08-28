@@ -64,9 +64,14 @@ mod tests {
 
     #[test]
     fn varies_across_seeds() {
-        let variants: std::collections::HashSet<String> =
-            (0..50).map(|s| random(&mut StdRng::seed_from_u64(s))).collect();
-        assert!(variants.len() > 10, "получено всего {} вариантов", variants.len());
+        let variants: std::collections::HashSet<String> = (0..50)
+            .map(|s| random(&mut StdRng::seed_from_u64(s)))
+            .collect();
+        assert!(
+            variants.len() > 10,
+            "получено всего {} вариантов",
+            variants.len()
+        );
     }
 
     #[test]
