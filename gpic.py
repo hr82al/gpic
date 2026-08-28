@@ -24,13 +24,23 @@ ROOT = Path(__file__).resolve().parent
 SD_BINARY = ROOT / "build" / "sd"
 MODELS = ROOT / "models"
 
-# Q8_0 выбран осознанно, вопреки замеру: сравнение с Q5_K_S на одном
-# сюжете видимой разницы не показало, а по показателям детализации Q5
-# был даже чуть выше. Но время у них одинаковое (упор в вычисления, а не
-# в перекачку весов), так что Q8 стоит только памяти: пик 17.4 ГБ против
-# 11.1. При 27 ГБ на машине это приемлемо.
-DIFFUSION_MODEL = MODELS / "flux1-schnell-Q8_0.gguf"
-TEXT_ENCODER = MODELS / "t5xxl-Q8_0.gguf"
+# Веса от лучшего к запасному: берётся первый ДОКАЧАННЫЙ. Ожидаемый размер
+# указан именно для этого — на оборванном файле движок выдаёт невнятное
+# «read tensor data failed», и понять причину без подсказки трудно.
+#
+# Q8_0 против Q5_K_S: сравнение на одном сюжете видимой разницы не показало,
+# а по показателям детализации Q5 был даже чуть выше. Но время у них
+# одинаковое (упор в вычисления, а не в перекачку весов), так что Q8 стоит
+# только памяти — пик 17.4 ГБ против 11.1. При 27 ГБ это приемлемо.
+DIFFUSION_WEIGHTS = [
+    ("flux1-schnell-Q8_0.gguf", 12_690_000_000),
+    ("flux1-schnell-Q5_K_S.gguf", 8_260_000_000),
+]
+
+TEXT_ENCODERS = [
+    ("t5xxl-Q8_0.gguf", 5_200_000_000),
+    ("t5xxl-Q5_0.gguf", 3_360_000_000),
+]
 CLIP_L = MODELS / "clip_l.safetensors"
 VAE = MODELS / "ae.safetensors"
 
@@ -436,20 +446,45 @@ def align_up(value, step):
     return max(step, -(-value // step) * step)
 
 
+def pick_complete(candidates):
+    """Первый из файлов, который есть на диске и докачан целиком.
+
+    Допуск в процент: у зеркал размер иногда отличается на десятки байт.
+    """
+    for name, expected in candidates:
+        path = MODELS / name
+        if path.exists() and path.stat().st_size >= expected * 0.99:
+            return path
+    return None
+
+
 def check_installed(fast):
     """Понятная ошибка вместо загадочного падения, если setup.sh не запускали."""
     needed = [SD_BINARY]
+    model = encoder = None
     if fast:
-        needed += [FAST_MODEL]
+        needed.append(FAST_MODEL)
     else:
-        needed += [DIFFUSION_MODEL, TEXT_ENCODER, CLIP_L, VAE]
+        needed += [CLIP_L, VAE]
+        model = pick_complete(DIFFUSION_WEIGHTS)
+        encoder = pick_complete(TEXT_ENCODERS)
+
     missing = [str(p) for p in needed if not p.exists()]
+    if not fast:
+        if model is None:
+            missing.append(f"{MODELS}/{DIFFUSION_WEIGHTS[-1][0]} (или Q8_0)")
+        if encoder is None:
+            missing.append(f"{MODELS}/{TEXT_ENCODERS[-1][0]} (или Q8_0)")
+
     if missing:
-        print("Не хватает файлов движка или весов:", file=sys.stderr)
+        print("Не хватает файлов движка или весов "
+              "(или они докачаны не полностью):", file=sys.stderr)
         for path in missing:
             print(f"  {path}", file=sys.stderr)
         print(f"\nЗапусти установку: {ROOT / 'setup.sh'}", file=sys.stderr)
         sys.exit(1)
+
+    return model, encoder
 
 
 def build_fast_command(prompt, width, height, seed, out_path):
@@ -471,10 +506,10 @@ def build_fast_command(prompt, width, height, seed, out_path):
     ]
 
 
-def build_command(prompt, width, height, seed, out_path):
+def build_command(model, encoder, prompt, width, height, seed, out_path):
     return [
         str(SD_BINARY),
-        "--diffusion-model", str(DIFFUSION_MODEL),
+        "--diffusion-model", str(model),
         # Flash attention здесь не оптимизация, а необходимость: без него
         # тензоры внимания не влезают в лимит буфера Vulkan, движок
         # сваливается на медленный путь и шаг занимает 337 с вместо 88.
@@ -489,7 +524,7 @@ def build_command(prompt, width, height, seed, out_path):
         # Текстовые энкодеры нужны только на первой стадии, для кодирования
         # промпта. Без этого флага их 3.4 ГБ висят в видеопамяти до конца.
         "--params-backend", "te=disk",
-        "--t5xxl", str(TEXT_ENCODER),
+        "--t5xxl", str(encoder),
         "--clip_l", str(CLIP_L),
         "--vae", str(VAE),
         "-p", prompt,
@@ -529,7 +564,7 @@ def main():
     )
     args = parser.parse_args()
 
-    check_installed(args.fast)
+    model, encoder = check_installed(args.fast)
 
     rng = random.Random()
     width, height = args.resolution or detect_screen()
@@ -550,8 +585,10 @@ def main():
         print("Быстрый режим: SDXL-Turbo, около минуты")
         command = build_fast_command(prompt, aligned[0], aligned[1], seed, out_path)
     else:
+        print(f"Модель: {model.name}, энкодер: {encoder.name}")
         print("Генерация идёт локально и занимает несколько минут…")
-        command = build_command(prompt, aligned[0], aligned[1], seed, out_path)
+        command = build_command(model, encoder, prompt,
+                                aligned[0], aligned[1], seed, out_path)
 
     started = time.monotonic()
     # Вывод движка идёт в stderr и показывает прогресс по шагам — не прячем его.
