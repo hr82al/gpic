@@ -14,6 +14,7 @@ import argparse
 import random
 import subprocess
 import sys
+import zlib
 import time
 from datetime import datetime
 from pathlib import Path
@@ -23,13 +24,29 @@ ROOT = Path(__file__).resolve().parent
 SD_BINARY = ROOT / "build" / "sd"
 MODELS = ROOT / "models"
 
-DIFFUSION_MODEL = MODELS / "flux1-schnell-Q5_K_S.gguf"
-TEXT_ENCODER = MODELS / "t5xxl-Q5_0.gguf"
+# Q8_0 выбран осознанно, вопреки замеру: сравнение с Q5_K_S на одном
+# сюжете видимой разницы не показало, а по показателям детализации Q5
+# был даже чуть выше. Но время у них одинаковое (упор в вычисления, а не
+# в перекачку весов), так что Q8 стоит только памяти: пик 17.4 ГБ против
+# 11.1. При 27 ГБ на машине это приемлемо.
+DIFFUSION_MODEL = MODELS / "flux1-schnell-Q8_0.gguf"
+TEXT_ENCODER = MODELS / "t5xxl-Q8_0.gguf"
 CLIP_L = MODELS / "clip_l.safetensors"
 VAE = MODELS / "ae.safetensors"
 
+# Быстрый режим: SDXL-Turbo вместо FLUX. Вчетверо меньше параметров и
+# дистиллирован под один-два шага — 1920x1216 за минуту против шести с
+# половиной у FLUX.
+#
+# Опасение, что модель, обученная на 512x512, начнёт дублировать объекты
+# в разрешении экрана, замером не подтвердилось: композиция остаётся
+# связной. Поэтому рисуем сразу в полном размере, без всякого увеличения.
+FAST_MODEL = MODELS / "sdxl-turbo-fp16.safetensors"
+FAST_STEPS = 2
+FAST_CFG_SCALE = "1.0"
+
 # Маленькая языковая модель, придумывающая описания «с нуля». Нужна не
-# всегда: без неё работает комбинаторика по спискам, просто беднее.
+# всегда: без неё работает запасной список описаний, просто беднее.
 LLAMA_BINARY = ROOT / "build" / "llama-cli"
 PROMPTER_MODEL = MODELS / "prompter.gguf"
 
@@ -150,7 +167,7 @@ FALLBACK_PROMPTS = [
 ]
 
 
-def llm_prompt(rng):
+def llm_prompt(rng, force_creative=False):
     """Просит языковую модель придумать описание. None, если не вышло.
 
     Отсутствие модели не ошибка: gpic должен работать и без llama.cpp,
@@ -160,7 +177,7 @@ def llm_prompt(rng):
         return None
 
     style = rng.choice(STYLE_HINTS)
-    if rng.random() < CREATIVE_CHANCE:
+    if force_creative or rng.random() < CREATIVE_CHANCE:
         instruction = CREATIVE_INSTRUCTION.format(
             angle=rng.choice(CREATIVE_ANGLES), style=style)
         temperature = CREATIVE_TEMPERATURE
@@ -232,9 +249,9 @@ def clean_llm_output(text):
     return None
 
 
-def compose_prompt(rng):
+def compose_prompt(rng, force_creative=False):
     """Описание от языковой модели, а при её отсутствии — из запасного списка."""
-    generated = llm_prompt(rng)
+    generated = llm_prompt(rng, force_creative)
     if generated:
         return f"{generated}, {QUALITY_TAIL}"
     return f"{rng.choice(FALLBACK_PROMPTS)}, {QUALITY_TAIL}"
@@ -283,24 +300,175 @@ def detect_screen():
     return FALLBACK_RESOLUTION
 
 
-def align16(value):
-    """FLUX работает с размерами, кратными 16."""
-    return max(16, round(value / 16) * 16)
+def _png_chunks(data):
+    """Разбирает PNG на чанки. Возвращает пары (тип, содержимое)."""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("не PNG")
+    pos = 8
+    while pos < len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        kind = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        yield kind, body
+        pos += 12 + length
 
 
-def check_installed():
+def _unfilter(raw, width, height, channels):
+    """Снимает построчные фильтры PNG, возвращает плоский массив пикселей."""
+    stride = width * channels
+    out = bytearray(stride * height)
+    prev = bytearray(stride)
+    pos = 0
+    for row in range(height):
+        filter_type = raw[pos]
+        pos += 1
+        line = bytearray(raw[pos:pos + stride])
+        pos += stride
+        if filter_type == 1:  # Sub
+            for i in range(channels, stride):
+                line[i] = (line[i] + line[i - channels]) & 0xFF
+        elif filter_type == 2:  # Up
+            for i in range(stride):
+                line[i] = (line[i] + prev[i]) & 0xFF
+        elif filter_type == 3:  # Average
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                line[i] = (line[i] + ((left + prev[i]) >> 1)) & 0xFF
+        elif filter_type == 4:  # Paeth
+            for i in range(stride):
+                left = line[i - channels] if i >= channels else 0
+                up = prev[i]
+                upleft = prev[i - channels] if i >= channels else 0
+                p = left + up - upleft
+                pa, pb, pc = abs(p - left), abs(p - up), abs(p - upleft)
+                if pa <= pb and pa <= pc:
+                    pred = left
+                elif pb <= pc:
+                    pred = up
+                else:
+                    pred = upleft
+                line[i] = (line[i] + pred) & 0xFF
+        elif filter_type != 0:
+            raise ValueError(f"неизвестный фильтр PNG: {filter_type}")
+        out[row * stride:(row + 1) * stride] = line
+        prev = line
+    return out
+
+
+def _write_png(path, pixels, width, height, channels):
+    """Пишет PNG без фильтрации — короче кода и достаточно быстро."""
+    color_type = {3: 2, 4: 6}[channels]
+    stride = width * channels
+    raw = bytearray()
+    for row in range(height):
+        raw.append(0)
+        raw += pixels[row * stride:(row + 1) * stride]
+
+    def chunk(kind, body):
+        return (len(body).to_bytes(4, "big") + kind + body
+                + zlib.crc32(kind + body).to_bytes(4, "big"))
+
+    header = (width.to_bytes(4, "big") + height.to_bytes(4, "big")
+              + bytes([8, color_type, 0, 0, 0]))
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+        + chunk(b"IEND", b"")
+    )
+
+
+def crop_png(path, target_width, target_height):
+    """Подрезает PNG по центру до точного размера.
+
+    Нужно потому, что движок выравнивает размеры: SDXL до кратного 64,
+    FLUX до кратного 16. Запрошенные 1920x1200 превращаются в 1920x1216,
+    и без подрезки на экране оказывались бы обои не того размера.
+
+    Разбор PNG написан руками ради обещания «только стандартная
+    библиотека»: тянуть Pillow ради обрезки шестнадцати строк пикселей
+    несоразмерно. Поддерживается ровно то, что пишет движок — 8 бит,
+    RGB или RGBA, без чересстрочности.
+    """
+    data = path.read_bytes()
+    idat = bytearray()
+    width = height = channels = None
+    for kind, body in _png_chunks(data):
+        if kind == b"IHDR":
+            width = int.from_bytes(body[0:4], "big")
+            height = int.from_bytes(body[4:8], "big")
+            depth, color_type, _, _, interlace = body[8:13]
+            if depth != 8 or interlace != 0 or color_type not in (2, 6):
+                return False
+            channels = 3 if color_type == 2 else 4
+        elif kind == b"IDAT":
+            idat += body
+        elif kind == b"IEND":
+            break
+
+    if width is None or (width, height) == (target_width, target_height):
+        return False
+    if width < target_width or height < target_height:
+        return False
+
+    pixels = _unfilter(zlib.decompress(bytes(idat)), width, height, channels)
+
+    left = (width - target_width) // 2
+    top = (height - target_height) // 2
+    stride = width * channels
+    new_stride = target_width * channels
+    cropped = bytearray(new_stride * target_height)
+    for row in range(target_height):
+        start = (top + row) * stride + left * channels
+        cropped[row * new_stride:(row + 1) * new_stride] = \
+            pixels[start:start + new_stride]
+
+    _write_png(path, cropped, target_width, target_height, channels)
+    return True
+
+
+def align_up(value, step):
+    """Округляет размер ВВЕРХ до кратного step.
+
+    Движок всё равно выровняет размер сам, поэтому лучше сделать это
+    заранее и вверх: тогда лишнее можно подрезать, а не дорисовывать.
+    """
+    return max(step, -(-value // step) * step)
+
+
+def check_installed(fast):
     """Понятная ошибка вместо загадочного падения, если setup.sh не запускали."""
-    missing = [
-        str(p)
-        for p in (SD_BINARY, DIFFUSION_MODEL, TEXT_ENCODER, CLIP_L, VAE)
-        if not p.exists()
-    ]
+    needed = [SD_BINARY]
+    if fast:
+        needed += [FAST_MODEL]
+    else:
+        needed += [DIFFUSION_MODEL, TEXT_ENCODER, CLIP_L, VAE]
+    missing = [str(p) for p in needed if not p.exists()]
     if missing:
         print("Не хватает файлов движка или весов:", file=sys.stderr)
         for path in missing:
             print(f"  {path}", file=sys.stderr)
         print(f"\nЗапусти установку: {ROOT / 'setup.sh'}", file=sys.stderr)
         sys.exit(1)
+
+
+def build_fast_command(prompt, width, height, seed, out_path):
+    """SDXL-Turbo в полном размере, без увеличения."""
+    return [
+        str(SD_BINARY),
+        "-m", str(FAST_MODEL),
+        "--diffusion-fa",
+        "--vae-tiling",
+        "--params-backend", "te=disk",
+        "-p", prompt,
+        "-W", str(width),
+        "-H", str(height),
+        "--steps", str(FAST_STEPS),
+        "--cfg-scale", FAST_CFG_SCALE,
+        "--sampling-method", SAMPLING,
+        "--seed", str(seed),
+        "-o", str(out_path),
+    ]
 
 
 def build_command(prompt, width, height, seed, out_path):
@@ -347,17 +515,29 @@ def main():
     )
     parser.add_argument("-s", "--seed", type=int, help="seed для воспроизведения картинки")
     parser.add_argument(
+        "--random", action="store_true",
+        help="всегда творческий режим вместо 30%% случаев: необычные, "
+             "неожиданные сюжеты",
+    )
+    parser.add_argument(
+        "-f", "--fast", action="store_true",
+        help="быстрый режим: SDXL-Turbo вместо FLUX, десятки секунд вместо минут",
+    )
+    parser.add_argument(
         "file", nargs="?",
         help="путь или просто имя файла; без него — gpic-ГГГГММДД-ЧЧММСС.png",
     )
     args = parser.parse_args()
 
-    check_installed()
+    check_installed(args.fast)
 
     rng = random.Random()
     width, height = args.resolution or detect_screen()
-    aligned = (align16(width), align16(height))
-    prompt = args.prompt or compose_prompt(rng)
+    # Движок выравнивает размеры: SDXL до кратного 64, FLUX до 16. Округляем
+    # ВВЕРХ, чтобы потом подрезать до запрошенного, а не растягивать.
+    step = 64 if args.fast else 16
+    aligned = (align_up(width, step), align_up(height, step))
+    prompt = args.prompt or compose_prompt(rng, args.random)
     seed = args.seed if args.seed is not None else rng.randrange(0, 2**31)
 
     out_path = Path(
@@ -365,15 +545,15 @@ def main():
     )
 
     print(f"Промпт: {prompt}")
-    if aligned != (width, height):
-        print(f"Размер: {aligned[0]}x{aligned[1]} (запрошено {width}x{height}, "
-              f"выровнено до кратного 16), seed: {seed}")
+    print(f"Размер: {width}x{height}, seed: {seed}")
+    if args.fast:
+        print("Быстрый режим: SDXL-Turbo, около минуты")
+        command = build_fast_command(prompt, aligned[0], aligned[1], seed, out_path)
     else:
-        print(f"Размер: {width}x{height}, seed: {seed}")
-    print("Генерация идёт локально и занимает несколько минут…")
+        print("Генерация идёт локально и занимает несколько минут…")
+        command = build_command(prompt, aligned[0], aligned[1], seed, out_path)
 
     started = time.monotonic()
-    command = build_command(prompt, aligned[0], aligned[1], seed, out_path)
     # Вывод движка идёт в stderr и показывает прогресс по шагам — не прячем его.
     # Устройство Vulkan не навязываем: ggml сам отбрасывает программный
     # llvmpipe и выбирает настоящую видеокарту. Зашитый номер устройства
@@ -387,6 +567,13 @@ def main():
     if not out_path.exists():
         print(f"\nОшибка: движок отработал, но файл {out_path} не появился", file=sys.stderr)
         sys.exit(1)
+
+    # Движок округлил размер вверх — возвращаем ровно то, что просили.
+    try:
+        crop_png(out_path, width, height)
+    except (OSError, ValueError, zlib.error) as e:
+        print(f"Предупреждение: не удалось подрезать до {width}x{height}: {e}",
+              file=sys.stderr)
 
     print(f"\nГотово за {elapsed:.0f} с: {out_path}")
 

@@ -152,18 +152,23 @@ fetch() {
 
 fetch_models() {
     mkdir -p "$MODELS"
-    # Q5_K_S: пик памяти при генерации 1920x1200 — 11 ГБ из 27, так что
-    # запасной облегчённый вес не нужен. Ключевое здесь не квантование, а
-    # флаги в gpic.py (тайловый VAE и выгрузка энкодеров): без них тот же
-    # вес требовал 27 ГБ и ронял драйвер.
-    fetch "flux1-schnell-Q5_K_S.gguf" "city96/FLUX.1-schnell-gguf" "flux1-schnell-Q5_K_S.gguf"
-    fetch "t5xxl-Q5_0.gguf"           "second-state/FLUX.1-schnell-GGUF" "t5xxl-Q5_0.gguf"
+    # Q8_0: пик памяти при генерации 1920x1200 — 17.4 ГБ из 27. Q5_K_S
+    # обошёлся бы 11.1 ГБ при неотличимой картинке и том же времени, но
+    # выбран более точный вес. Ключевое здесь не квантование, а флаги в
+    # gpic.py (тайловый VAE и выгрузка энкодеров): без них любой вес
+    # требовал 27 ГБ и ронял драйвер.
+    fetch "flux1-schnell-Q8_0.gguf" "city96/FLUX.1-schnell-gguf" "flux1-schnell-Q8_0.gguf"
+    fetch "t5xxl-Q8_0.gguf"          "second-state/FLUX.1-schnell-GGUF" "t5xxl-Q8_0.gguf"
     fetch "clip_l.safetensors"        "second-state/FLUX.1-schnell-GGUF" "clip_l.safetensors"
     fetch "ae.safetensors"            "second-state/FLUX.1-schnell-GGUF" "ae.safetensors"
     # Модель, придумывающая описания. Полтора миллиарда параметров: на
     # 0.5B заметно беднее фантазия, а генерация тридцати токенов на фоне
     # шестиминутной отрисовки картинки ничего не стоит.
     fetch "prompter.gguf" "Qwen/Qwen2.5-1.5B-Instruct-GGUF" "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    # Быстрый режим (--fast): 1920x1216 за минуту против шести с половиной
+    # у FLUX. Опасение, что модель, обученная на 512x512, начнёт дублировать
+    # объекты в полном размере, замером не подтвердилось.
+    fetch "sdxl-turbo-fp16.safetensors" "stabilityai/sdxl-turbo" "sd_xl_turbo_1.0_fp16.safetensors"
     say "Веса на месте, суммарно $(du -sh "$MODELS" | cut -f1)"
 }
 
