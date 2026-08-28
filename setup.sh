@@ -181,6 +181,9 @@ fetch_models() {
     # у FLUX. Опасение, что модель, обученная на 512x512, начнёт дублировать
     # объекты в полном размере, замером не подтвердилось.
     fetch "sdxl-turbo-fp16.safetensors" "stabilityai/sdxl-turbo" "sd_xl_turbo_1.0_fp16.safetensors"
+    # Нейросетевое увеличение для быстрого режима: SDXL-Turbo рисует в
+    # четверть размера (иначе дублирует объекты), ESRGAN возвращает размер.
+    fetch "RealESRGAN_x4.pth" "ai-forever/Real-ESRGAN" "RealESRGAN_x4.pth"
     say "Веса на месте, суммарно $(du -sh "$MODELS" | cut -f1)"
 }
 

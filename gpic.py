@@ -45,15 +45,22 @@ CLIP_L = MODELS / "clip_l.safetensors"
 VAE = MODELS / "ae.safetensors"
 
 # Быстрый режим: SDXL-Turbo вместо FLUX. Вчетверо меньше параметров и
-# дистиллирован под один-два шага — 1920x1216 за минуту против шести с
-# половиной у FLUX.
+# дистиллирован под один-два шага.
 #
-# Опасение, что модель, обученная на 512x512, начнёт дублировать объекты
-# в разрешении экрана, замером не подтвердилось: композиция остаётся
-# связной. Поэтому рисуем сразу в полном размере, без всякого увеличения.
+# Рисуем в четверть целевого размера и увеличиваем нейросетевым ESRGAN.
+# Прямая генерация в разрешении экрана НЕ работает: модель обучена на
+# 512x512, и на площади в девять раз большей она достраивает композицию
+# повторением — сросшиеся фигуры, лишние руки, два горизонта. На пейзаже
+# это незаметно (лишняя гряда сходит за гряду), на людях видно сразу.
+#
+# Негативным промптом это не лечится: у Turbo cfg-scale равен 1.0, а при
+# единице classifier-free guidance выключен и негативный промпт не
+# действует. Поднять cfg нельзя — модель под него не дистиллирована.
 FAST_MODEL = MODELS / "sdxl-turbo-fp16.safetensors"
+UPSCALER = MODELS / "RealESRGAN_x4.pth"
 FAST_STEPS = 2
 FAST_CFG_SCALE = "1.0"
+FAST_UPSCALE = 4
 
 # Маленькая языковая модель, придумывающая описания «с нуля». Нужна не
 # всегда: без неё работает запасной список описаний, просто беднее.
@@ -463,7 +470,7 @@ def check_installed(fast):
     needed = [SD_BINARY]
     model = encoder = None
     if fast:
-        needed.append(FAST_MODEL)
+        needed += [FAST_MODEL, UPSCALER]
     else:
         needed += [CLIP_L, VAE]
         model = pick_complete(DIFFUSION_WEIGHTS)
@@ -488,10 +495,11 @@ def check_installed(fast):
 
 
 def build_fast_command(prompt, width, height, seed, out_path):
-    """SDXL-Turbo в полном размере, без увеличения."""
+    """SDXL-Turbo в четверти размера плюс нейросетевое увеличение вчетверо."""
     return [
         str(SD_BINARY),
         "-m", str(FAST_MODEL),
+        "--upscale-model", str(UPSCALER),
         "--diffusion-fa",
         "--vae-tiling",
         "--params-backend", "te=disk",
@@ -570,8 +578,12 @@ def main():
     width, height = args.resolution or detect_screen()
     # Движок выравнивает размеры: SDXL до кратного 64, FLUX до 16. Округляем
     # ВВЕРХ, чтобы потом подрезать до запрошенного, а не растягивать.
-    step = 64 if args.fast else 16
-    aligned = (align_up(width, step), align_up(height, step))
+    # В быстром режиме рисуем в четверть — увеличение вернёт размер.
+    if args.fast:
+        aligned = (align_up(width // FAST_UPSCALE, 64),
+                   align_up(height // FAST_UPSCALE, 64))
+    else:
+        aligned = (align_up(width, 16), align_up(height, 16))
     prompt = args.prompt or compose_prompt(rng, args.random)
     seed = args.seed if args.seed is not None else rng.randrange(0, 2**31)
 
@@ -582,7 +594,9 @@ def main():
     print(f"Промпт: {prompt}")
     print(f"Размер: {width}x{height}, seed: {seed}")
     if args.fast:
-        print("Быстрый режим: SDXL-Turbo, около минуты")
+        print(f"Быстрый режим: SDXL-Turbo рисует {aligned[0]}x{aligned[1]}, "
+              f"ESRGAN увеличивает до {aligned[0] * FAST_UPSCALE}x"
+              f"{aligned[1] * FAST_UPSCALE}")
         command = build_fast_command(prompt, aligned[0], aligned[1], seed, out_path)
     else:
         print(f"Модель: {model.name}, энкодер: {encoder.name}")
